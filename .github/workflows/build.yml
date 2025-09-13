@@ -1,0 +1,55 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up JUCE
+        run: |
+          git clone --depth 1 https://github.com/juce-framework/JUCE.git deps/juce
+      - name: Configure
+        run: cmake -B build -S . -DJUCE_DIR=deps/juce
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Sign (macOS)
+        if: matrix.os == 'macos-latest' && env.CODESIGN_IDENTITY != ''
+        run: |
+          codesign --force --sign "$CODESIGN_IDENTITY" build/*.vst3 || true
+      - name: Sign (Windows)
+        if: matrix.os == 'windows-latest' && env.SIGNTOOL_EXE != ''
+        run: |
+          $env:SIGNTOOL_EXE sign /a build\*.vst3
+      - name: Run tests
+        run: |
+          cd build
+          ctest --output-on-failure
+      - name: Package
+        run: |
+          cd build
+          cpack -C Release
+      - name: Rename package
+        run: mv build/SamuRiser-*.zip build/SamuRiser-${{ matrix.os }}.zip
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: samuriser-${{ matrix.os }}
+          path: build/SamuRiser-${{ matrix.os }}.zip
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: actions/upload-release-asset@v1
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: build/SamuRiser-${{ matrix.os }}.zip
+          asset_name: SamuRiser-${{ matrix.os }}.zip
+          asset_content_type: application/zip
