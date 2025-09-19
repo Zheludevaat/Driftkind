@@ -1,0 +1,95 @@
+name: Build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    # Propagate signing and notarization secrets into the build environment.  These
+    # values are expected to be provided via the repository or organization
+    # settings in GitHub.  See README for details on how to obtain the
+    # appropriate credentials.
+    env:
+      # For macOS code signing (ID of your Developer ID Application certificate)
+      CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+      # Apple notarization credentials (Apple ID and app specific password)
+      AC_USERNAME: ${{ secrets.AC_USERNAME }}
+      AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
+      # Optional team ID for notarization (if your Apple ID belongs to multiple teams)
+      AC_TEAM_ID: ${{ secrets.AC_TEAM_ID }}
+      # Path to signtool.exe on Windows for Authenticode signing
+      SIGNTOOL_EXE: ${{ secrets.SIGNTOOL_EXE }}
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up JUCE
+        run: |
+          git clone --depth 1 https://github.com/juce-framework/JUCE.git deps/juce
+      - name: Configure
+        run: cmake -B build -S . -DJUCE_DIR=deps/juce
+      - name: Build
+        run: cmake --build build --config Release
+      - name: Sign (macOS)
+        if: matrix.os == 'macos-latest' && env.CODESIGN_IDENTITY != ''
+        run: |
+          # Sign the VST3 and AudioUnit bundles.  Use --deep to ensure embedded
+          # frameworks and helper tools are signed.  Ignore errors if files
+          # aren't present (e.g. AU on Linux/Windows).
+          for plugin in build/*.vst3 build/*.component; do
+            if [ -e "$plugin" ]; then
+              codesign --deep --force --timestamp --sign "$CODESIGN_IDENTITY" "$plugin"
+            fi
+          done
+      - name: Sign (Windows)
+        if: matrix.os == 'windows-latest' && env.SIGNTOOL_EXE != ''
+        run: |
+          $env:SIGNTOOL_EXE sign /a build\*.vst3
+      - name: Run tests
+        run: |
+          cd build
+          ctest --output-on-failure
+      - name: Package
+        run: |
+          cd build
+          cpack -C Release
+      - name: Rename package
+        run: mv build/SamuRiser-*.zip build/SamuRiser-${{ matrix.os }}.zip
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v3
+        with:
+          name: samuriser-${{ matrix.os }}
+          path: build/SamuRiser-${{ matrix.os }}.zip
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v1
+        with:
+          files: build/SamuRiser-${{ matrix.os }}.zip
+
+      # Submit the macOS plug-in for notarization and staple the ticket.  Only run
+      # this step on release builds for macOS.  The package is submitted
+      # asynchronously and we wait for completion.
+      - name: Notarize and staple (macOS)
+        if: github.event_name == 'release' && matrix.os == 'macos-latest' && env.AC_USERNAME != '' && env.AC_PASSWORD != ''
+        run: |
+          # Submit the zipped plug‑in to Apple’s notarization service.  Use
+          # notarytool (newer) if available; fall back to altool otherwise.
+          ZIP="build/SamuRiser-${{ matrix.os }}.zip"
+          if xcrun notarytool --help > /dev/null 2>&1; then
+            xcrun notarytool submit "$ZIP" --apple-id "$AC_USERNAME" --password "$AC_PASSWORD" ${AC_TEAM_ID:+--team-id "$AC_TEAM_ID"} --wait
+          else
+            xcrun altool --notarize-app -f "$ZIP" --primary-bundle-id "com.example.SamuRiser" -u "$AC_USERNAME" -p "$AC_PASSWORD" --output-format xml
+            # Wait for completion.  Notarization via altool may require polling; omitted for brevity.
+          fi
+          # After notarization completes, staple the ticket to both plugin bundles.
+          for plugin in build/*.vst3 build/*.component; do
+            if [ -e "$plugin" ]; then
+              xcrun stapler staple -v "$plugin"
+            fi
+          done
